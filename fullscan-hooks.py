@@ -15,23 +15,8 @@ def zap_started(zap, target):
     """
     print("[HOOK] zap_started: Starting endpoint discovery...")
 
-    # ========== Phase 0: Auth headers + scope restriction ==========
-    print("[HOOK] Phase 0: Configuring auth headers and scope...")
-
-    # Build target URL regex for scoping (e.g. "http://example.com:8080" → "http://example\\.com:8080.*")
-    from urllib.parse import urlparse
-    parsed = urlparse(target)
-    target_regex = re.escape(parsed.scheme + "://" + parsed.netloc) + ".*"
-
-    # Restrict ZAP context to target domain only — prevents spider/scanner from going off-scope
-    try:
-        zap.context.include_in_context("Default Context", target_regex)
-        zap.context.exclude_from_context("Default Context", "(?:(?!%s).)*" % re.escape(parsed.netloc))
-        print(f"[HOOK] Phase 0: Scope restricted to {parsed.netloc}")
-    except Exception as e:
-        print(f"[HOOK] Phase 0: Scope restriction failed (non-fatal): {e}")
-
-    # Inject auth headers via replacer — scoped to target domain only (prevents token leak to external domains)
+    # ========== Phase 0: Inject auth headers via replacer (no Jython needed) ==========
+    print("[HOOK] Phase 0: Configuring auth headers...")
     header_count = 0
     for key, value in os.environ.items():
         if key.startswith("ZAP_AUTH_HEADER_"):
@@ -41,11 +26,10 @@ def zap_started(zap, target):
                     zap.base + "replacer/action/addRule/",
                     {"description": f"Auth-{header_name}", "enabled": "true",
                      "matchType": "REQ_HEADER", "matchRegex": "false",
-                     "matchString": header_name, "replacement": value,
-                     "url": target_regex}
+                     "matchString": header_name, "replacement": value}
                 )
                 header_count += 1
-                print(f"[HOOK] Phase 0: Added header → {header_name} (scoped to {parsed.netloc})")
+                print(f"[HOOK] Phase 0: Added header → {header_name}")
             except Exception as e:
                 print(f"[HOOK] Phase 0: Failed to add header {header_name}: {e}")
     if header_count == 0:
@@ -244,3 +228,63 @@ def zap_started(zap, target):
 
     print(f"[HOOK] Fed {fed_count} total requests to ZAP")
     print(f"[HOOK] Discovery complete. ZAP active scanner will now attack {len(expanded)} endpoints")
+
+
+def zap_pre_shutdown(zap):
+    """
+    Called right before ZAP shuts down. Fetches the HTTP request/response for
+    every alert and writes them to a supplementary messages file so the Go
+    service can include response data in the webhook payload.
+    """
+    import json
+
+    print("[HOOK] zap_pre_shutdown: Starting response extraction for alerts...")
+    scan_id = os.environ.get("SCAN_ID", "")
+    if not scan_id:
+        print("[HOOK] zap_stopped: SCAN_ID env var not set, skipping response extraction")
+        return
+
+    output_path = f"/zap/wrk/results/{scan_id}-messages.json"
+    MAX_BODY_BYTES = 10 * 1024  # 10 KB per response body
+
+    try:
+        print("[HOOK] zap_stopped: Extracting HTTP responses for alerts...")
+        alerts = zap.alert.alerts(start=0, count=10000)
+
+        # key: sourceid (message ID) — matches ParsedAlert.SourceID in the Go report
+        messages_map = {}
+        MAX_MESSAGES = 500  # cap to keep the file size and hook time reasonable
+
+        for alert in alerts:
+            if len(messages_map) >= MAX_MESSAGES:
+                break
+            msg_id = str(alert.get("messageId") or alert.get("message-id") or "")
+            if not msg_id or msg_id in messages_map:
+                continue
+
+            try:
+                msg = zap.core.message(id=msg_id)
+                resp_body = msg.get("responseBody", "") or ""
+                if len(resp_body) > MAX_BODY_BYTES:
+                    resp_body = resp_body[:MAX_BODY_BYTES] + " ... [truncated]"
+                req_body = msg.get("requestBody", "") or ""
+                if len(req_body) > MAX_BODY_BYTES:
+                    req_body = req_body[:MAX_BODY_BYTES] + " ... [truncated]"
+                messages_map[msg_id] = {
+                    "requestHeader":  msg.get("requestHeader", "") or "",
+                    "requestBody":    req_body,
+                    "responseHeader": msg.get("responseHeader", "") or "",
+                    "responseBody":   resp_body,
+                }
+            except Exception as e:
+                print(f"[HOOK] zap_stopped: Could not fetch message {msg_id}: {e}")
+
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(messages_map, f)
+
+        print(f"[HOOK] zap_stopped: Wrote {len(messages_map)} request/response pairs to {output_path}")
+
+    except Exception as e:
+        print(f"[HOOK] zap_stopped: Error during response extraction: {e}")
+        traceback.print_exc()
